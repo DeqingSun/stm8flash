@@ -243,33 +243,61 @@ static void stlink2_cmd(programmer_t *pgm, unsigned int length, ...) {
 	va_end(ap);
 }
 
+static void stlink2_swim_resync(programmer_t *pgm) {
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_RESET, 0x00, 0x01);
+	usleep(1000);
+
+	/* Match STVP reset-attach ordering more closely. */
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_ASSERT_RESET, 0x00, 0x01);
+	usleep(1000);
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_DEASSERT_RESET, 0x00, 0x01);
+	usleep(1000);
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_ASSERT_RESET, 0x00, 0x01);
+	usleep(1000);
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_ENTER_SEQ, 0x00, 0x01);
+	usleep(1000);
+	/* Mask IRQ / stall CPU like legacy stm8flash open path. */
+	swim_write_byte(pgm, 0xa1, 0x7f80);
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_DEASSERT_RESET, 0x00, 0x01);
+	usleep(1000);
+}
+
 static void swim_cmd_internal(programmer_t *pgm, unsigned char *buf, unsigned int buf_len, unsigned int length, va_list ap) {
 	int stalls = 0;
+	int resyncs = 0;
 	unsigned char status[2][4];
 	int set = 0;
 
-	stlink2_cmd_internal(pgm, buf, buf_len, length, ap);
+	while (resyncs < 2) {
+		stlink2_cmd_internal(pgm, buf, buf_len, length, ap);
+		stalls = 0;
+		while (stalls < 4) {
 
-	while (stalls < 4) {
+			stlink2_cmd(pgm,2,STLINK_SWIM,SWIM_READSTATUS);
+			msg_recv(pgm, status[set], 4);
+			DEBUG_PRINT("        status %02x %02x %02x %02x\n", status[set][0], status[set][1], status[set][2], status[set][3]);
 
-		stlink2_cmd(pgm,2,STLINK_SWIM,SWIM_READSTATUS);
-		msg_recv(pgm, status[set], 4);
-		DEBUG_PRINT("        status %02x %02x %02x %02x\n", status[set][0], status[set][1], status[set][2], status[set][3]);
+			if (status[set][0] == STLINK_SWIM_OK) {
+				// We're done!
+				return;
+			}
 
-		if (status[set][0] == STLINK_SWIM_OK) {
-			// We're done!
-			return;
+			// Still waiting...
+			if (memcmp(status[0], status[1], 4))
+				stalls = 0;
+			else
+				stalls++;
+
+			set ^= 1;
+			usleep(10000);
+			//usleep(100);
 		}
-
-		// Still waiting...
-		if (memcmp(status[0], status[1], 4))
-			stalls = 0;
-		else
-			stalls++;
-
-		set ^= 1;
-		usleep(10000);
-		//usleep(100);
+		if (status[set][0] == STLINK_SWIM_NO_RESPONSE) {
+			stlink2_swim_resync(pgm);	//deal with no response by resyncing and retrying the command
+			resyncs++;
+		}else{
+			break;	//let it fail
+		}
 	}
 	ERROR2("SWIM error 0x%02x\n", status[set][0]);
 }

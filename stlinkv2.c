@@ -243,35 +243,71 @@ static void stlink2_cmd(programmer_t *pgm, unsigned int length, ...) {
 	va_end(ap);
 }
 
+static void stlink2_swim_resync(programmer_t *pgm) {
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_RESET, 0x00, 0x01);
+	usleep(1000);
+
+	/* Match STVP reset-attach ordering more closely. */
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_ASSERT_RESET, 0x00, 0x01);
+	usleep(1000);
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_DEASSERT_RESET, 0x00, 0x01);
+	usleep(1000);
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_ASSERT_RESET, 0x00, 0x01);
+	usleep(1000);
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_ENTER_SEQ, 0x00, 0x01);
+	usleep(1000);
+	/* Mask IRQ / stall CPU like legacy stm8flash open path. */
+	swim_write_byte(pgm, 0xa1, 0x7f80);
+	stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_DEASSERT_RESET, 0x00, 0x01);
+	usleep(1000);
+}
+
 static void swim_cmd_internal(programmer_t *pgm, unsigned char *buf, unsigned int buf_len, unsigned int length, va_list ap) {
-	int stalls = 0;
-	unsigned char status[2][4];
-	int set = 0;
+	//printf("stlink2_open_in_progress = %d\n", stlink2_open_in_progress);
+	unsigned char status[4];
+	int polls = 0;
+	unsigned char err = STLINK_SWIM_OK;
+	int recoveries = 0;
+	const int max_polls =  30;
 
-	stlink2_cmd_internal(pgm, buf, buf_len, length, ap);
+retry_command:
+	{
+		stlink2_cmd_internal(pgm, buf, buf_len, length, ap);
+	}
+	polls = 0;
+	while (polls < max_polls) {
+		//printf("polls = %d\n", polls);
 
-	while (stalls < 4) {
+		stlink2_cmd(pgm, 4, STLINK_SWIM, SWIM_READSTATUS, 0x00, 0x01);
+		msg_recv(pgm, status, 4);
+		DEBUG_PRINT("        status %02x %02x %02x %02x\n", status[0], status[1], status[2], status[3]);
+		err = status[0];
 
-		stlink2_cmd(pgm,2,STLINK_SWIM,SWIM_READSTATUS);
-		msg_recv(pgm, status[set], 4);
-		DEBUG_PRINT("        status %02x %02x %02x %02x\n", status[set][0], status[set][1], status[set][2], status[set][3]);
-
-		if (status[set][0] == STLINK_SWIM_OK) {
+		if (err == STLINK_SWIM_OK) {
 			// We're done!
 			return;
 		}
 
-		// Still waiting...
-		if (memcmp(status[0], status[1], 4))
-			stalls = 0;
-		else
-			stalls++;
+		// Treat transient statuses as busy; STVP traces show these while connect recovers.
+		if (err == STLINK_SWIM_BUSY ||
+			err == STLINK_SWIM_NO_RESPONSE || err == STLINK_SWIM_BAD_STATE ||
+			err == 0x10) {
+			polls++;
+			if ((err == STLINK_SWIM_NO_RESPONSE || err == STLINK_SWIM_BAD_STATE || err == 0x10) &&
+				recoveries < (2) &&
+				(polls % 4) == 0) {
+				recoveries++;
+				fprintf(stderr, "SWIM transient 0x%02x, resync %d/%d\n", err, recoveries, 2);
+				stlink2_swim_resync(pgm);
+				goto retry_command;
+			}
+			usleep(10000);
+			continue;
+		}
 
-		set ^= 1;
-		usleep(10000);
-		//usleep(100);
+		break;
 	}
-	ERROR2("SWIM error 0x%02x\n", status[set][0]);
+	ERROR2("SWIM error 0x%02x\n", err);
 }
 
 static void swim_cmd(programmer_t *pgm, unsigned int length, ...) {
@@ -371,7 +407,7 @@ bool stlink2_open(programmer_t *pgm) {
 
 	swim_cmd(pgm, 2, STLINK_SWIM, SWIM_ASSERT_RESET);
 
-	swim_cmd(pgm, 2, STLINK_SWIM, SWIM_ENTER_SEQ);
+	swim_cmd(pgm, 2, STLINK_SWIM, SWIM_ENTER_SEQ);	// Here is the when the resync is needed
 
 	// Mask internal interrupt sources, enable access to whole of memory,
 	// prioritize SWIM and stall the CPU.
